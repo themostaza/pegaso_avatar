@@ -14,20 +14,33 @@ export async function POST(request: NextRequest) {
       );
     }
     
-    const sessionId = logData.session_id || 'no-session';
+    const sessionId = logData.session_id;
+    
+    if (!sessionId) {
+      return NextResponse.json(
+        { error: 'session_id è richiesto' },
+        { status: 400 }
+      );
+    }
     
     // 1. Cerca se esiste già un record per questa sessione
+    // Usa .maybeSingle() invece di .single() per evitare errore quando non ci sono risultati
     const { data: existing, error: fetchError } = await supabase
       .from('chat_logs')
       .select('*')
-      .eq('data->>session_id', sessionId)
-      .single();
+      .filter('data->>session_id', 'eq', sessionId)
+      .maybeSingle();
+    
+    // Se c'è un errore reale (non "nessun risultato"), logga e continua con insert
+    if (fetchError && fetchError.code !== 'PGRST116') {
+      console.error('Errore nella ricerca del record:', fetchError);
+    }
     
     let result;
     
-    if (existing) {
+    if (existing && existing.data) {
       // 2a. Aggiorna il record esistente aggiungendo il nuovo messaggio
-      const currentMessages = existing.data?.messages || [];
+      const currentMessages = Array.isArray(existing.data.messages) ? existing.data.messages : [];
       const updatedMessages = [
         ...currentMessages,
         {
@@ -41,7 +54,7 @@ export async function POST(request: NextRequest) {
         .from('chat_logs')
         .update({
           data: {
-            session_id: sessionId,
+            ...existing.data,
             messages: updatedMessages,
             last_updated: new Date().toISOString()
           }
@@ -50,6 +63,7 @@ export async function POST(request: NextRequest) {
         .select();
       
       if (error) {
+        console.error('Errore update Supabase:', error);
         return NextResponse.json(
           { error: 'Errore nell\'aggiornare su Supabase', details: error.message },
           { status: 500 }
@@ -78,6 +92,7 @@ export async function POST(request: NextRequest) {
         .select();
       
       if (error) {
+        console.error('Errore insert Supabase:', error);
         return NextResponse.json(
           { error: 'Errore nel salvare su Supabase', details: error.message },
           { status: 500 }
@@ -89,6 +104,7 @@ export async function POST(request: NextRequest) {
     
     return NextResponse.json({ success: true, data: result });
   } catch (error) {
+    console.error('Errore generale log API:', error);
     return NextResponse.json(
       { error: 'Errore nel salvare il log', details: String(error) },
       { status: 500 }

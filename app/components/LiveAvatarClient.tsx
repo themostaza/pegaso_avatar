@@ -25,28 +25,42 @@ export default function LiveAvatarClient({
   const videoRef = useRef<HTMLVideoElement>(null);
   const avatarInstanceRef = useRef<any>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const sessionIdRef = useRef<string | null>(null);
 
-  // Funzione per loggare le conversazioni
+  // Aggiorna il ref quando sessionId cambia
+  useEffect(() => {
+    sessionIdRef.current = sessionId;
+  }, [sessionId]);
+
+  // Funzione per loggare le conversazioni (usa ref per evitare closure stale)
   const logConversation = async (type: 'user' | 'avatar', message: string, metadata?: any) => {
-    try {
-      await fetch('/api/liveavatar/log', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          session_id: sessionId,
-          type,
-          message,
-          metadata,
-          timestamp: new Date().toISOString(),
-        }),
-      });
-      
+    const currentSessionId = sessionIdRef.current;
+    
+    // Non loggare se non c'è una sessione attiva
+    if (!currentSessionId) {
+      console.warn('logConversation: sessione non disponibile');
+      return;
+    }
+    
+    // Invia in background senza bloccare
+    fetch('/api/liveavatar/log', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        session_id: currentSessionId,
+        type,
+        message,
+        metadata,
+        timestamp: new Date().toISOString(),
+      }),
+    }).then(() => {
       if (onConversationLog) {
         onConversationLog({ type, message, metadata });
       }
-    } catch (err) {
+    }).catch((err) => {
       // Errore silenzioso per non interrompere l'esperienza utente
-    }
+      console.error('Errore log conversazione:', err);
+    });
   };
 
   // Inizializza la sessione
