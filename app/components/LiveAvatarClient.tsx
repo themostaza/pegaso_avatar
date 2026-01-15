@@ -1,19 +1,11 @@
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, useCallback } from 'react';
 import ReactMarkdown from 'react-markdown';
 import { SessionEvent, AgentEventsEnum } from '@heygen/liveavatar-web-sdk';
 
-interface LiveAvatarClientProps {
-  sessionId?: string;
-  onConversationLog?: (log: any) => void;
-}
-
-export default function LiveAvatarClient({ 
-  sessionId: initialSessionId,
-  onConversationLog 
-}: LiveAvatarClientProps) {
-  const [sessionId, setSessionId] = useState<string | null>(initialSessionId || null);
+export default function LiveAvatarClient() {
+  const [sessionId, setSessionId] = useState<string | null>(null);
   const [sessionToken, setSessionToken] = useState<string | null>(null);
   const [status, setStatus] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
   const [error, setError] = useState<string | null>(null);
@@ -22,93 +14,53 @@ export default function LiveAvatarClient({
   const [hasUserInteracted, setHasUserInteracted] = useState(false);
   const [textInput, setTextInput] = useState('');
   const [showChatOnMobile, setShowChatOnMobile] = useState(false);
+  const [connectionQuality, setConnectionQuality] = useState<'GOOD' | 'BAD' | 'UNKNOWN'>('UNKNOWN');
   const videoRef = useRef<HTMLVideoElement>(null);
   const avatarInstanceRef = useRef<any>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
-  const sessionIdRef = useRef<string | null>(null);
+  const keepAliveIntervalRef = useRef<NodeJS.Timeout | null>(null);
   
-  // Buffer per messaggi da salvare in batch
-  const messageBufferRef = useRef<Array<{type: 'user' | 'avatar', text: string, timestamp: string}>>([]);
-  const SAVE_INTERVAL = 10000; // 10 secondi
-  const MESSAGES_THRESHOLD = 5; // Salva ogni 5 messaggi
+  // Ref per tracciare le trascrizioni in corso (per evitare duplicati)
+  const currentUserTranscriptRef = useRef<string | null>(null);
+  const currentAvatarTranscriptRef = useRef<string | null>(null);
 
-  // Aggiorna il ref quando sessionId cambia
-  useEffect(() => {
-    sessionIdRef.current = sessionId;
-  }, [sessionId]);
-
-  // Funzione per aggiungere messaggi al buffer (non-bloccante)
-  const addToBuffer = (type: 'user' | 'avatar', text: string) => {
-    messageBufferRef.current.push({
-      type,
-      text,
-      timestamp: new Date().toISOString()
-    });
-    
-    // Salva automaticamente ogni N messaggi
-    if (messageBufferRef.current.length >= MESSAGES_THRESHOLD) {
-      flushBuffer();
+  // Keep-alive: mantiene la sessione attiva chiamando l'endpoint periodicamente
+  const startKeepAlive = useCallback((token: string) => {
+    // Pulisci eventuali intervalli precedenti
+    if (keepAliveIntervalRef.current) {
+      clearInterval(keepAliveIntervalRef.current);
     }
-  };
 
-  // Salvataggio buffer (fire-and-forget, non-bloccante)
-  const flushBuffer = () => {
-    if (messageBufferRef.current.length === 0) return;
-    if (!sessionIdRef.current) return;
-    
-    const messagesToSave = [...messageBufferRef.current];
-    messageBufferRef.current = []; // Svuota subito il buffer
-    
-    // NON usare await - lascia che vada in background
-    fetch('/api/liveavatar/log/batch', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        session_id: sessionIdRef.current,
-        messages: messagesToSave
-      }),
-    }).then(() => {
-      if (onConversationLog) {
-        messagesToSave.forEach(msg => {
-          onConversationLog({ type: msg.type, message: msg.text });
+    // Chiama keep-alive ogni 30 secondi
+    keepAliveIntervalRef.current = setInterval(async () => {
+      try {
+        const response = await fetch('/api/liveavatar/keep-alive', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ session_token: token }),
         });
+        
+        if (!response.ok) {
+          console.warn('Keep-alive fallito:', await response.text());
+        }
+      } catch (err) {
+        console.warn('Errore keep-alive:', err);
       }
-    }).catch((err) => {
-      console.error('Errore salvataggio batch:', err);
-      // Re-inserisci i messaggi nel buffer per ritentare
-      messageBufferRef.current.unshift(...messagesToSave);
-    });
-  };
+    }, 30000); // 30 secondi
+  }, []);
 
-  // Salvataggio buffer con await (solo per chiusura esplicita)
-  const flushBufferAndWait = async () => {
-    if (messageBufferRef.current.length === 0) return;
-    if (!sessionIdRef.current) return;
-    
-    const messagesToSave = [...messageBufferRef.current];
-    messageBufferRef.current = [];
-    
-    try {
-      await fetch('/api/liveavatar/log/batch', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          session_id: sessionIdRef.current,
-          messages: messagesToSave
-        }),
-      });
-    } catch (err) {
-      console.error('Errore salvataggio finale:', err);
+  const stopKeepAlive = useCallback(() => {
+    if (keepAliveIntervalRef.current) {
+      clearInterval(keepAliveIntervalRef.current);
+      keepAliveIntervalRef.current = null;
     }
-  };
+  }, []);
 
   // Inizializza la sessione
   const initializeSession = async (langOverride?: string) => {
     try {
       setStatus('loading');
       setError(null);
-      
-      // Pulisci i messaggi solo quando avvii una nuova sessione
       setMessages([]);
 
       const currentLanguage = langOverride || language;
@@ -116,13 +68,12 @@ export default function LiveAvatarClient({
       // 1. Richiedi permesso microfono
       try {
         const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        // Ferma lo stream, l'SDK lo riattiverà
         stream.getTracks().forEach(track => track.stop());
       } catch (err) {
         throw new Error('Permesso microfono necessario per parlare con l\'avatar');
       }
 
-      // 2. Ottieni il session token con la lingua selezionata
+      // 2. Ottieni il session token
       const tokenResponse = await fetch('/api/liveavatar/token', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -138,23 +89,16 @@ export default function LiveAvatarClient({
       setSessionId(tokenData.session_id);
       setSessionToken(tokenData.session_token);
 
-      // 2. Inizializza l'SDK LiveAvatar
-      // L'SDK gestisce tutto internamente - non serve chiamare /start separatamente!
       if (videoRef.current && tokenData.session_token) {
-        // Importa dinamicamente l'SDK
         const { LiveAvatarSession } = await import('@heygen/liveavatar-web-sdk');
         
         const avatar = new LiveAvatarSession(tokenData.session_token, {
           voiceChat: true,
         });
 
-        // Event listeners per il ciclo di vita della sessione
-        avatar.on(SessionEvent.SESSION_STATE_CHANGED, (state: any) => {
-          console.log('Session state changed:', state);
-        });
+        avatar.on(SessionEvent.SESSION_STATE_CHANGED, (state: any) => {});
 
         avatar.on(SessionEvent.SESSION_STREAM_READY, async () => {
-          console.log('Stream ready');
           if (videoRef.current) {
             try {
               videoRef.current.muted = false;
@@ -169,100 +113,61 @@ export default function LiveAvatarClient({
               }
             }
           }
-          
           setStatus('ready');
+          
+          // Avvia il keep-alive per mantenere la sessione attiva
+          if (tokenData.session_token) {
+            startKeepAlive(tokenData.session_token);
+          }
         });
 
         avatar.on(SessionEvent.SESSION_DISCONNECTED, (reason: any) => {
-          console.error('Sessione disconnessa:', reason);
-          // Salva i messaggi rimanenti prima di disconnettere
-          flushBuffer();
           setStatus('error');
-          setError(`Sessione disconnessa: ${JSON.stringify(reason)}`);
+          setError('Sessione disconnessa: ' + reason);
         });
 
         avatar.on(SessionEvent.SESSION_CONNECTION_QUALITY_CHANGED, (quality: any) => {
-          console.log('Connection quality:', quality);
-          // Se la qualità è scarsa, logga un warning per debug
-          if (quality === 'poor' || quality === 'bad') {
-            console.warn('⚠️ Qualità connessione degradata:', quality);
-          }
+          setConnectionQuality(quality);
         });
 
-        // IMPORTANTE: Invia un ping periodico per mantenere la sessione attiva
-        // Questo previene i timeout di Vercel e mantiene WebRTC vivo
-        const keepAliveInterval = setInterval(() => {
-          if (avatarInstanceRef.current) {
-            try {
-              // L'SDK HeyGen mantiene la connessione attiva internamente,
-              // ma verifichiamo che lo stream sia ancora attivo
-              if (videoRef.current && videoRef.current.paused && status === 'ready') {
-                console.log('Video in pausa, tento di riprodurlo...');
-                videoRef.current.play().catch(() => {});
-              }
-            } catch (e) {
-              console.warn('Keep-alive check failed:', e);
-            }
-          }
-        }, 5000); // Ogni 5 secondi
-
-        // Salva il riferimento all'intervallo per il cleanup
-        (avatar as any)._keepAliveInterval = keepAliveInterval;
-
-        // Event listeners per le interazioni
-        avatar.on(AgentEventsEnum.USER_SPEAK_STARTED, () => {});
+        // Eventi utente
+        avatar.on(AgentEventsEnum.USER_SPEAK_STARTED, () => {
+          // Reset della trascrizione utente quando inizia a parlare
+          currentUserTranscriptRef.current = null;
+        });
         avatar.on(AgentEventsEnum.USER_SPEAK_ENDED, () => {});
 
-        // USER_TRANSCRIPTION: mostra nella UI e salva nel buffer (non-bloccante)
+        // Trascrizione utente - evita duplicati confrontando con testo precedente
         avatar.on(AgentEventsEnum.USER_TRANSCRIPTION, (event: any) => {
-          if (event.text) {
+          if (event.text && event.text !== currentUserTranscriptRef.current) {
+            currentUserTranscriptRef.current = event.text;
             setMessages(prev => [...prev, { type: 'user', text: event.text, timestamp: new Date().toISOString() }]);
-            addToBuffer('user', event.text);
           }
         });
 
+        // Eventi avatar
         avatar.on(AgentEventsEnum.AVATAR_SPEAK_STARTED, () => {
-          console.log('🎤 Avatar inizia a parlare');
+          // Reset della trascrizione avatar quando inizia a parlare
+          currentAvatarTranscriptRef.current = null;
         });
-        avatar.on(AgentEventsEnum.AVATAR_SPEAK_ENDED, () => {
-          console.log('🎤 Avatar ha finito di parlare');
-        });
+        avatar.on(AgentEventsEnum.AVATAR_SPEAK_ENDED, () => {});
 
-        // AVATAR_TRANSCRIPTION: mostra nella UI e salva nel buffer (non-bloccante)
+        // Trascrizione avatar - evita duplicati confrontando con testo precedente
         avatar.on(AgentEventsEnum.AVATAR_TRANSCRIPTION, (event: any) => {
-          if (event.text) {
+          if (event.text && event.text !== currentAvatarTranscriptRef.current) {
+            currentAvatarTranscriptRef.current = event.text;
             setMessages(prev => [...prev, { type: 'avatar', text: event.text, timestamp: new Date().toISOString() }]);
-            addToBuffer('avatar', event.text);
           }
         });
 
         avatarInstanceRef.current = avatar;
         
-        // Avvia la sessione PRIMA di attaccare
         await avatar.start();
-        
-        // Attacca il video element DOPO l'avvio
         avatar.attach(videoRef.current);
         
-        // Configura audio/video
         if (videoRef.current) {
           videoRef.current.muted = false;
           videoRef.current.volume = 1.0;
-          
-          // IMPORTANTE: Gestione degli eventi di stallo del video
-          // Questi eventi indicano problemi di streaming in produzione
-          videoRef.current.addEventListener('stalled', () => {
-            console.warn('⚠️ Video stalled - tentativo di ripresa...');
-            videoRef.current?.play().catch(() => {});
-          });
-          
-          videoRef.current.addEventListener('waiting', () => {
-            console.log('Video in attesa di dati...');
-          });
-          
-          videoRef.current.addEventListener('error', (e) => {
-            console.error('❌ Errore video:', e);
-          });
         }
       }
     } catch (err: any) {
@@ -270,50 +175,6 @@ export default function LiveAvatarClient({
       setStatus('error');
     }
   };
-
-  // Salvataggio periodico automatico ogni 10 secondi
-  useEffect(() => {
-    const intervalId = setInterval(() => {
-      if (messageBufferRef.current.length > 0) {
-        flushBuffer();
-      }
-    }, SAVE_INTERVAL);
-    
-    return () => clearInterval(intervalId);
-  }, []);
-
-  // Cattura chiusura tab/browser con beforeunload + sendBeacon
-  useEffect(() => {
-    const handleBeforeUnload = () => {
-      if (messageBufferRef.current.length > 0 && sessionIdRef.current) {
-        // sendBeacon è progettato per essere affidabile durante l'unload
-        const data = JSON.stringify({
-          session_id: sessionIdRef.current,
-          messages: messageBufferRef.current
-        });
-        
-        navigator.sendBeacon(
-          '/api/liveavatar/log/batch', 
-          new Blob([data], { type: 'application/json' })
-        );
-      }
-    };
-    
-    window.addEventListener('beforeunload', handleBeforeUnload);
-    return () => window.removeEventListener('beforeunload', handleBeforeUnload);
-  }, []);
-
-  // Salvataggio quando la tab diventa invisibile
-  useEffect(() => {
-    const handleVisibilityChange = () => {
-      if (document.hidden && messageBufferRef.current.length > 0) {
-        flushBuffer();
-      }
-    };
-    
-    document.addEventListener('visibilitychange', handleVisibilityChange);
-    return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
-  }, []);
 
   // Scroll automatico ai nuovi messaggi
   useEffect(() => {
@@ -327,24 +188,16 @@ export default function LiveAvatarClient({
     }
   }, [hasUserInteracted, status]);
 
-  // Handler per l'interazione iniziale
   const handleInitialInteraction = () => {
     setHasUserInteracted(true);
   };
 
-  // Funzione per inviare un messaggio testuale
   const sendTextMessage = () => {
     if (!textInput.trim() || !avatarInstanceRef.current || status !== 'ready') return;
-    
-    // Invia il messaggio all'avatar
-    // L'SDK emetterà l'evento USER_TRANSCRIPTION che aggiungerà il messaggio alla chat
     avatarInstanceRef.current.message(textInput);
-    
-    // Pulisci l'input
     setTextInput('');
   };
 
-  // Handler per invio con Enter
   const handleKeyPress = (e: React.KeyboardEvent<HTMLInputElement>) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
@@ -352,27 +205,25 @@ export default function LiveAvatarClient({
     }
   };
 
-  // Funzione per chiudere la sessione
   const closeSession = async () => {
-    // Salva tutti i messaggi rimasti nel buffer prima di chiudere
-    await flushBufferAndWait();
+    // Ferma il keep-alive
+    stopKeepAlive();
+    
+    // Reset delle trascrizioni in corso
+    currentUserTranscriptRef.current = null;
+    currentAvatarTranscriptRef.current = null;
     
     if (avatarInstanceRef.current) {
-      // Pulisci l'intervallo di keep-alive
-      if ((avatarInstanceRef.current as any)._keepAliveInterval) {
-        clearInterval((avatarInstanceRef.current as any)._keepAliveInterval);
-      }
       await avatarInstanceRef.current.stop();
       avatarInstanceRef.current = null;
     }
     setStatus('idle');
-    setHasUserInteracted(false); // Reset per mostrare di nuovo il bottone "Avvia conversazione"
-    // Non pulire i messaggi - rimangono visibili fino alla prossima sessione
+    setHasUserInteracted(false);
     setSessionId(null);
     setSessionToken(null);
+    setConnectionQuality('UNKNOWN');
   };
 
-  // Funzione per cambiare lingua (riavvia la sessione)
   const changeLanguage = async (newLang: 'it' | 'en' | 'es' | 'fr' | 'de') => {
     await closeSession();
     setLanguage(newLang);
@@ -382,29 +233,19 @@ export default function LiveAvatarClient({
   // Cleanup quando il componente viene smontato
   useEffect(() => {
     return () => {
+      // Ferma il keep-alive
+      stopKeepAlive();
+      
       if (avatarInstanceRef.current) {
-        // Pulisci l'intervallo di keep-alive
-        if ((avatarInstanceRef.current as any)._keepAliveInterval) {
-          clearInterval((avatarInstanceRef.current as any)._keepAliveInterval);
-        }
         avatarInstanceRef.current.stop();
       }
     };
-  }, []);
-
-  const languageNames = {
-    it: '🇮🇹 Italiano',
-    en: '🇬🇧 English',
-    es: '🇪🇸 Español',
-    fr: '🇫🇷 Français',
-    de: '🇩🇪 Deutsch',
-  };
+  }, [stopKeepAlive]);
 
   return (
     <div className="w-full h-screen flex flex-col lg:flex-row gap-4 p-4 bg-zinc-50 dark:bg-zinc-900">
-      {/* Colonna sinistra - Video (nascosto su mobile se chat è aperta) */}
+      {/* Colonna sinistra - Video */}
       <div className={`flex-1 flex flex-col ${showChatOnMobile ? 'hidden lg:flex' : 'flex'}`}>
-        {/* Video container */}
         <div className="relative w-full flex-1 bg-black rounded-2xl shadow-2xl overflow-hidden">
           <video
             ref={videoRef}
@@ -415,10 +256,8 @@ export default function LiveAvatarClient({
             controls={false}
           />
           
-          {/* Bottoni - al centro in basso */}
           {status === 'ready' && (
-            <div className="absolute bottom-6 left-1/2 transform -translate-x-1/2 flex gap-3">
-              {/* Bottone toggle chat (solo mobile) */}
+            <div className="absolute bottom-6 left-1/2 transform -translate-x-1/2 flex gap-3 items-center">
               <button
                 onClick={() => setShowChatOnMobile(!showChatOnMobile)}
                 className="lg:hidden w-14 h-14 bg-zinc-800 hover:bg-zinc-700 rounded-full flex items-center justify-center transition-all shadow-lg hover:shadow-xl"
@@ -429,7 +268,20 @@ export default function LiveAvatarClient({
                 </svg>
               </button>
               
-              {/* Bottone chiudi chiamata */}
+              {/* Indicatore qualità connessione */}
+              <div 
+                className="w-10 h-10 bg-zinc-800 rounded-full flex items-center justify-center shadow-lg"
+                title={`Connessione: ${connectionQuality === 'GOOD' ? 'Buona' : connectionQuality === 'BAD' ? 'Scarsa' : 'Sconosciuta'}`}
+              >
+                <svg xmlns="http://www.w3.org/2000/svg" className="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  {/* Barre del segnale */}
+                  <rect x="2" y="16" width="4" height="6" rx="1" className={connectionQuality !== 'UNKNOWN' ? (connectionQuality === 'GOOD' ? 'fill-green-500 stroke-green-500' : 'fill-red-500 stroke-red-500') : 'fill-zinc-500 stroke-zinc-500'} />
+                  <rect x="8" y="12" width="4" height="10" rx="1" className={connectionQuality !== 'UNKNOWN' ? (connectionQuality === 'GOOD' ? 'fill-green-500 stroke-green-500' : 'fill-zinc-600 stroke-zinc-600') : 'fill-zinc-500 stroke-zinc-500'} />
+                  <rect x="14" y="8" width="4" height="14" rx="1" className={connectionQuality === 'GOOD' ? 'fill-green-500 stroke-green-500' : 'fill-zinc-600 stroke-zinc-600'} />
+                  <rect x="20" y="4" width="4" height="18" rx="1" className={connectionQuality === 'GOOD' ? 'fill-green-500 stroke-green-500' : 'fill-zinc-600 stroke-zinc-600'} />
+                </svg>
+              </div>
+              
               <button
                 onClick={closeSession}
                 className="w-14 h-14 bg-red-600 hover:bg-red-700 rounded-full flex items-center justify-center transition-all shadow-lg hover:shadow-xl"
@@ -443,11 +295,9 @@ export default function LiveAvatarClient({
             </div>
           )}
           
-          {/* Overlay iniziale per interazione utente */}
           {!hasUserInteracted && (
             <div className="absolute inset-0 flex items-center justify-center bg-black bg-opacity-90 z-50">
               <div className="text-center">
-                {/* Favicon circolare */}
                 <div className="mb-6 flex justify-center">
                   <div className="w-24 h-24 rounded-full bg-white flex items-center justify-center shadow-xl overflow-hidden">
                     <img 
@@ -471,7 +321,6 @@ export default function LiveAvatarClient({
             </div>
           )}
 
-          {/* Overlay per gli stati */}
           {hasUserInteracted && status !== 'ready' && (
             <div className="absolute inset-0 flex items-center justify-center bg-black bg-opacity-70">
               {status === 'idle' && (
@@ -505,9 +354,8 @@ export default function LiveAvatarClient({
         </div>
       </div>
 
-      {/* Colonna destra - Trascrizione conversazione (nascosta su mobile se video è visibile) */}
+      {/* Colonna destra - Chat */}
       <div className={`w-full lg:w-96 h-full flex flex-col bg-white dark:bg-zinc-800 rounded-2xl shadow-xl overflow-hidden relative ${showChatOnMobile ? 'flex' : 'hidden lg:flex'}`}>
-        {/* Header con bottone chiudi (solo mobile) */}
         <div className="lg:hidden flex items-center justify-end p-4 border-b border-zinc-200 dark:border-zinc-700">
           <button
             onClick={() => setShowChatOnMobile(false)}
@@ -552,7 +400,6 @@ export default function LiveAvatarClient({
           <div ref={messagesEndRef} />
         </div>
 
-        {/* Input per messaggi testuali - FISSO in fondo */}
         {status === 'ready' && (
           <div className="absolute bottom-0 left-0 right-0 p-4 bg-white dark:bg-zinc-800 border-t border-zinc-200 dark:border-zinc-700">
             <div className="flex gap-2">
@@ -581,4 +428,3 @@ export default function LiveAvatarClient({
     </div>
   );
 }
-
