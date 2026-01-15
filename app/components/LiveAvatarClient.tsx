@@ -26,41 +26,80 @@ export default function LiveAvatarClient({
   const avatarInstanceRef = useRef<any>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const sessionIdRef = useRef<string | null>(null);
+  
+  // Buffer per messaggi da salvare in batch
+  const messageBufferRef = useRef<Array<{type: 'user' | 'avatar', text: string, timestamp: string}>>([]);
+  const SAVE_INTERVAL = 10000; // 10 secondi
+  const MESSAGES_THRESHOLD = 5; // Salva ogni 5 messaggi
 
   // Aggiorna il ref quando sessionId cambia
   useEffect(() => {
     sessionIdRef.current = sessionId;
   }, [sessionId]);
 
-  // Funzione per loggare le conversazioni (usa ref per evitare closure stale)
-  const logConversation = async (type: 'user' | 'avatar', message: string, metadata?: any) => {
-    const currentSessionId = sessionIdRef.current;
+  // Funzione per aggiungere messaggi al buffer (non-bloccante)
+  const addToBuffer = (type: 'user' | 'avatar', text: string) => {
+    messageBufferRef.current.push({
+      type,
+      text,
+      timestamp: new Date().toISOString()
+    });
     
-    // Non loggare se non c'è una sessione attiva
-    if (!currentSessionId) {
-      console.warn('logConversation: sessione non disponibile');
-      return;
+    // Salva automaticamente ogni N messaggi
+    if (messageBufferRef.current.length >= MESSAGES_THRESHOLD) {
+      flushBuffer();
     }
+  };
+
+  // Salvataggio buffer (fire-and-forget, non-bloccante)
+  const flushBuffer = () => {
+    if (messageBufferRef.current.length === 0) return;
+    if (!sessionIdRef.current) return;
     
-    // Invia in background senza bloccare
-    fetch('/api/liveavatar/log', {
+    const messagesToSave = [...messageBufferRef.current];
+    messageBufferRef.current = []; // Svuota subito il buffer
+    
+    // NON usare await - lascia che vada in background
+    fetch('/api/liveavatar/log/batch', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        session_id: currentSessionId,
-        type,
-        message,
-        metadata,
-        timestamp: new Date().toISOString(),
+        session_id: sessionIdRef.current,
+        messages: messagesToSave
       }),
     }).then(() => {
       if (onConversationLog) {
-        onConversationLog({ type, message, metadata });
+        messagesToSave.forEach(msg => {
+          onConversationLog({ type: msg.type, message: msg.text });
+        });
       }
     }).catch((err) => {
-      // Errore silenzioso per non interrompere l'esperienza utente
-      console.error('Errore log conversazione:', err);
+      console.error('Errore salvataggio batch:', err);
+      // Re-inserisci i messaggi nel buffer per ritentare
+      messageBufferRef.current.unshift(...messagesToSave);
     });
+  };
+
+  // Salvataggio buffer con await (solo per chiusura esplicita)
+  const flushBufferAndWait = async () => {
+    if (messageBufferRef.current.length === 0) return;
+    if (!sessionIdRef.current) return;
+    
+    const messagesToSave = [...messageBufferRef.current];
+    messageBufferRef.current = [];
+    
+    try {
+      await fetch('/api/liveavatar/log/batch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          session_id: sessionIdRef.current,
+          messages: messagesToSave
+        }),
+      });
+    } catch (err) {
+      console.error('Errore salvataggio finale:', err);
+    }
   };
 
   // Inizializza la sessione
@@ -142,17 +181,23 @@ export default function LiveAvatarClient({
         avatar.on(AgentEventsEnum.USER_SPEAK_STARTED, () => {});
         avatar.on(AgentEventsEnum.USER_SPEAK_ENDED, () => {});
 
+        // USER_TRANSCRIPTION: mostra nella UI e salva nel buffer (non-bloccante)
         avatar.on(AgentEventsEnum.USER_TRANSCRIPTION, (event: any) => {
-          logConversation('user', event.text);
-          setMessages(prev => [...prev, { type: 'user', text: event.text, timestamp: new Date().toISOString() }]);
+          if (event.text) {
+            setMessages(prev => [...prev, { type: 'user', text: event.text, timestamp: new Date().toISOString() }]);
+            addToBuffer('user', event.text);
+          }
         });
 
         avatar.on(AgentEventsEnum.AVATAR_SPEAK_STARTED, () => {});
         avatar.on(AgentEventsEnum.AVATAR_SPEAK_ENDED, () => {});
 
+        // AVATAR_TRANSCRIPTION: mostra nella UI e salva nel buffer (non-bloccante)
         avatar.on(AgentEventsEnum.AVATAR_TRANSCRIPTION, (event: any) => {
-          logConversation('avatar', event.text);
-          setMessages(prev => [...prev, { type: 'avatar', text: event.text, timestamp: new Date().toISOString() }]);
+          if (event.text) {
+            setMessages(prev => [...prev, { type: 'avatar', text: event.text, timestamp: new Date().toISOString() }]);
+            addToBuffer('avatar', event.text);
+          }
         });
 
         avatarInstanceRef.current = avatar;
@@ -174,6 +219,50 @@ export default function LiveAvatarClient({
       setStatus('error');
     }
   };
+
+  // Salvataggio periodico automatico ogni 10 secondi
+  useEffect(() => {
+    const intervalId = setInterval(() => {
+      if (messageBufferRef.current.length > 0) {
+        flushBuffer();
+      }
+    }, SAVE_INTERVAL);
+    
+    return () => clearInterval(intervalId);
+  }, []);
+
+  // Cattura chiusura tab/browser con beforeunload + sendBeacon
+  useEffect(() => {
+    const handleBeforeUnload = () => {
+      if (messageBufferRef.current.length > 0 && sessionIdRef.current) {
+        // sendBeacon è progettato per essere affidabile durante l'unload
+        const data = JSON.stringify({
+          session_id: sessionIdRef.current,
+          messages: messageBufferRef.current
+        });
+        
+        navigator.sendBeacon(
+          '/api/liveavatar/log/batch', 
+          new Blob([data], { type: 'application/json' })
+        );
+      }
+    };
+    
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    return () => window.removeEventListener('beforeunload', handleBeforeUnload);
+  }, []);
+
+  // Salvataggio quando la tab diventa invisibile
+  useEffect(() => {
+    const handleVisibilityChange = () => {
+      if (document.hidden && messageBufferRef.current.length > 0) {
+        flushBuffer();
+      }
+    };
+    
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
+  }, []);
 
   // Scroll automatico ai nuovi messaggi
   useEffect(() => {
@@ -214,6 +303,9 @@ export default function LiveAvatarClient({
 
   // Funzione per chiudere la sessione
   const closeSession = async () => {
+    // Salva tutti i messaggi rimasti nel buffer prima di chiudere
+    await flushBufferAndWait();
+    
     if (avatarInstanceRef.current) {
       await avatarInstanceRef.current.stop();
       avatarInstanceRef.current = null;
