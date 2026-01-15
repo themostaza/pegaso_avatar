@@ -256,6 +256,16 @@ export default function LiveAvatarClient() {
             controls={false}
           />
           
+          {/* Bottone Privacy Policy - alto centro */}
+          <a
+            href="https://fondopegaso.it/privacy-policy-pegaso/"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="absolute top-3 left-1/2 transform -translate-x-1/2 px-3 py-1.5 bg-zinc-900/80 hover:bg-zinc-800/90 text-white text-xs rounded-lg transition-colors backdrop-blur-sm"
+          >
+            Privacy Policy
+          </a>
+          
           {status === 'ready' && (
             <div className="absolute bottom-6 left-1/2 transform -translate-x-1/2 flex gap-3 items-center">
               <button
@@ -317,6 +327,14 @@ export default function LiveAvatarClient() {
                 <p className="mt-4 text-white text-sm opacity-80">
                   Clicca per parlare con il tuo assistente virtuale
                 </p>
+                <a
+                  href="https://fondopegaso.it/privacy-policy-pegaso/"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="mt-3 inline-block text-white/60 hover:text-white/90 text-xs underline transition-colors"
+                >
+                  Privacy Policy
+                </a>
               </div>
             </div>
           )}
