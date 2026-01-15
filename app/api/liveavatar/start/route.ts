@@ -1,5 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
 
+// Aumenta il timeout per questa route (importante per Vercel)
+export const maxDuration = 60; // 60 secondi
+
 export async function POST(request: NextRequest) {
   try {
     const bodyText = await request.text();

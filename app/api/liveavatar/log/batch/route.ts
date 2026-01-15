@@ -1,6 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { supabase } from '@/app/lib/supabase';
 
+// Aumenta il timeout per questa route
+export const maxDuration = 30; // 30 secondi
+
 // Endpoint per salvataggio batch dei messaggi
 export async function POST(request: NextRequest) {
   try {

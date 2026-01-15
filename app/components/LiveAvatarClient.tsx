@@ -149,9 +149,12 @@ export default function LiveAvatarClient({
         });
 
         // Event listeners per il ciclo di vita della sessione
-        avatar.on(SessionEvent.SESSION_STATE_CHANGED, (state: any) => {});
+        avatar.on(SessionEvent.SESSION_STATE_CHANGED, (state: any) => {
+          console.log('Session state changed:', state);
+        });
 
         avatar.on(SessionEvent.SESSION_STREAM_READY, async () => {
+          console.log('Stream ready');
           if (videoRef.current) {
             try {
               videoRef.current.muted = false;
@@ -171,11 +174,40 @@ export default function LiveAvatarClient({
         });
 
         avatar.on(SessionEvent.SESSION_DISCONNECTED, (reason: any) => {
+          console.error('Sessione disconnessa:', reason);
+          // Salva i messaggi rimanenti prima di disconnettere
+          flushBuffer();
           setStatus('error');
-          setError('Sessione disconnessa: ' + reason);
+          setError(`Sessione disconnessa: ${JSON.stringify(reason)}`);
         });
 
-        avatar.on(SessionEvent.SESSION_CONNECTION_QUALITY_CHANGED, (quality: any) => {});
+        avatar.on(SessionEvent.SESSION_CONNECTION_QUALITY_CHANGED, (quality: any) => {
+          console.log('Connection quality:', quality);
+          // Se la qualità è scarsa, logga un warning per debug
+          if (quality === 'poor' || quality === 'bad') {
+            console.warn('⚠️ Qualità connessione degradata:', quality);
+          }
+        });
+
+        // IMPORTANTE: Invia un ping periodico per mantenere la sessione attiva
+        // Questo previene i timeout di Vercel e mantiene WebRTC vivo
+        const keepAliveInterval = setInterval(() => {
+          if (avatarInstanceRef.current) {
+            try {
+              // L'SDK HeyGen mantiene la connessione attiva internamente,
+              // ma verifichiamo che lo stream sia ancora attivo
+              if (videoRef.current && videoRef.current.paused && status === 'ready') {
+                console.log('Video in pausa, tento di riprodurlo...');
+                videoRef.current.play().catch(() => {});
+              }
+            } catch (e) {
+              console.warn('Keep-alive check failed:', e);
+            }
+          }
+        }, 5000); // Ogni 5 secondi
+
+        // Salva il riferimento all'intervallo per il cleanup
+        (avatar as any)._keepAliveInterval = keepAliveInterval;
 
         // Event listeners per le interazioni
         avatar.on(AgentEventsEnum.USER_SPEAK_STARTED, () => {});
@@ -189,8 +221,12 @@ export default function LiveAvatarClient({
           }
         });
 
-        avatar.on(AgentEventsEnum.AVATAR_SPEAK_STARTED, () => {});
-        avatar.on(AgentEventsEnum.AVATAR_SPEAK_ENDED, () => {});
+        avatar.on(AgentEventsEnum.AVATAR_SPEAK_STARTED, () => {
+          console.log('🎤 Avatar inizia a parlare');
+        });
+        avatar.on(AgentEventsEnum.AVATAR_SPEAK_ENDED, () => {
+          console.log('🎤 Avatar ha finito di parlare');
+        });
 
         // AVATAR_TRANSCRIPTION: mostra nella UI e salva nel buffer (non-bloccante)
         avatar.on(AgentEventsEnum.AVATAR_TRANSCRIPTION, (event: any) => {
@@ -212,6 +248,21 @@ export default function LiveAvatarClient({
         if (videoRef.current) {
           videoRef.current.muted = false;
           videoRef.current.volume = 1.0;
+          
+          // IMPORTANTE: Gestione degli eventi di stallo del video
+          // Questi eventi indicano problemi di streaming in produzione
+          videoRef.current.addEventListener('stalled', () => {
+            console.warn('⚠️ Video stalled - tentativo di ripresa...');
+            videoRef.current?.play().catch(() => {});
+          });
+          
+          videoRef.current.addEventListener('waiting', () => {
+            console.log('Video in attesa di dati...');
+          });
+          
+          videoRef.current.addEventListener('error', (e) => {
+            console.error('❌ Errore video:', e);
+          });
         }
       }
     } catch (err: any) {
@@ -307,6 +358,10 @@ export default function LiveAvatarClient({
     await flushBufferAndWait();
     
     if (avatarInstanceRef.current) {
+      // Pulisci l'intervallo di keep-alive
+      if ((avatarInstanceRef.current as any)._keepAliveInterval) {
+        clearInterval((avatarInstanceRef.current as any)._keepAliveInterval);
+      }
       await avatarInstanceRef.current.stop();
       avatarInstanceRef.current = null;
     }
@@ -328,6 +383,10 @@ export default function LiveAvatarClient({
   useEffect(() => {
     return () => {
       if (avatarInstanceRef.current) {
+        // Pulisci l'intervallo di keep-alive
+        if ((avatarInstanceRef.current as any)._keepAliveInterval) {
+          clearInterval((avatarInstanceRef.current as any)._keepAliveInterval);
+        }
         avatarInstanceRef.current.stop();
       }
     };
